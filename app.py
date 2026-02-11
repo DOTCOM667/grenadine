@@ -13,6 +13,8 @@ from collections import deque
 import gradio as gr
 
 # --- CONFIGURATION ---
+import os
+
 BACKUP_DIR = "backups"
 EXTERNAL_LOG_FILE = "messages_realtime.jsonl"
 
@@ -21,7 +23,7 @@ DB_CONFIG = {
  "host": os.getenv("MYSQL_HOST", "srv1653.hstgr.io"),
  "port": int(os.getenv("MYSQL_PORT", "3306")),
  "user": os.getenv("MYSQL_USER", "u122147766_Grenadine"),
- "password": os.getenv("MYSQL_PASSWORD="8Zhd1tqdf6"),
+ "password": os.getenv("MYSQL_PASSWORD"),
  "database": os.getenv("MYSQL_DATABASE", "u122147766_Grenadine"),
  "raise_on_warnings": True,
 }
