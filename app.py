@@ -18,11 +18,12 @@ EXTERNAL_LOG_FILE = "messages_realtime.jsonl"
 
 # Configuration MySQL via variables d'environnement
 DB_CONFIG = {
-    'host': os.environ.get('MYSQL_HOST'),
-    'user': os.environ.get('MYSQL_USER'),
-    'password': os.environ.get('MYSQL_PASSWORD'),
-    'database': os.environ.get('MYSQL_DATABASE'),
-    'raise_on_warnings': True
+ "host": os.getenv("MYSQL_HOST", "srv1653.hstgr.io"),
+ "port": int(os.getenv("MYSQL_PORT", "3306")),
+ "user": os.getenv("MYSQL_USER", "u122147766_Grenadine"),
+ "password": os.getenv("MYSQL_PASSWORD="8Zhd1tqdf6"),
+ "database": os.getenv("MYSQL_DATABASE", "u122147766_Grenadine"),
+ "raise_on_warnings": True,
 }
 
 # File d'attente pour traitement asynchrone
