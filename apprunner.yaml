@@ -1,0 +1,5 @@
+version: 1.0
+build:
+  builder: dockerfile
+run:
+  port: 7860
