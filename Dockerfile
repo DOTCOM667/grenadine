@@ -1,54 +1,21 @@
-FROM python:3.11-slim
+# Utiliser une image Python officielle avec support Playwright
+# Cette image contient déjà les navigateurs (Chrome, Firefox, etc.) et toutes les dépendances système.
+FROM mcr.microsoft.com/playwright/python:v1.41.2-jammy
 
-# Installer les dépendances système pour Playwright
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    libglib2.0-0 \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libdbus-1-3 \
-    libxcb1 \
-    libxkbcommon0 \
-    libx11-6 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
+# Définir le répertoire de travail à l'intérieur du conteneur
+WORKDIR /app
 
-# Créer un utilisateur non-root
-RUN useradd -m -u 1000 user
-USER user
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH
+# Copier le fichier des dépendances Python
+COPY requirements.txt .
 
-WORKDIR $HOME/app
+# Installer les dépendances listées dans requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Installer les dépendances Python
-COPY --chown=user requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Copier tout le reste de votre code (app.py, etc.) dans le conteneur
+COPY . .
 
-# Installer Chromium pour Playwright
-RUN playwright install chromium
-
-# Copier le code
-COPY --chown=user . .
-
-# Créer le dossier de backups
-RUN mkdir -p backups
-
-# Port pour Gradio (App Runner l'utilisera pour le health check)
+# Exposer le port que votre application Gradio utilise pour être accessible
 EXPOSE 7860
-ENV GRADIO_SERVER_NAME="0.0.0.0"
 
-CMD ["python3", "app.py"]
+# La commande qui sera exécutée au démarrage du conteneur pour lancer votre application
+CMD ["python", "app.py"]
