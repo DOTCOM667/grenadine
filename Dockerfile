@@ -1,21 +1,18 @@
 # Utiliser une image Python officielle avec support Playwright
-# Cette image contient déjà les navigateurs (Chrome, Firefox, etc.) et toutes les dépendances système.
 FROM mcr.microsoft.com/playwright/python:v1.41.2-jammy
 
-# Définir le répertoire de travail à l'intérieur du conteneur
+# Définir le répertoire de travail
 WORKDIR /app
 
-# Copier le fichier des dépendances Python
+# 1. Copier et installer les dépendances D'ABORD
 COPY requirements.txt .
-
-# Installer les dépendances listées dans requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copier tout le reste de votre code (app.py, etc.) dans le conteneur
+# 2. Copier le reste du code ENSUITE
 COPY . .
 
-# Exposer le port que votre application Gradio utilise pour être accessible
+# Exposer le port
 EXPOSE 7860
 
-# La commande qui sera exécutée au démarrage du conteneur pour lancer votre application
+# Lancer l'application
 CMD ["python", "app.py"]
