@@ -1,215 +1,212 @@
 import asyncio
-from playwright.async_api import async_playwright
-from datetime import datetime
+import os
+import threading
+import logging
+import sys
+
 import mysql.connector
-from mysql.connector import errorcode
-import os
-from huggingface_hub import HfApi
-import json
-import hashlib
-from pathlib import Path
-import aiofiles
-from collections import deque
+from mysql.connector import pooling, Error
 import gradio as gr
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
-# --- CONFIGURATION ---
-import os
+# --- Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
-BACKUP_DIR = "backups"
-EXTERNAL_LOG_FILE = "messages_realtime.jsonl"
+# Configuration de la base de données (lues depuis les variables d'environnement)
+DB_HOST = os.environ.get('MYSQL_HOST', 'grenadine.czowocaekxjw.us-east-2.rds.amazonaws.com')
+DB_USER = os.environ.get('MYSQL_USER', 'Grenadine')
+DB_PASSWORD = os.environ.get('MYSQL_PASSWORD', '5JFz4vQq52')
+DB_NAME = os.environ.get('MYSQL_DATABASE', 'u122147766_Grenadine')
+DB_PORT = int(os.environ.get('MYSQL_PORT', '3306'))
 
-# Configuration MySQL via variables d'environnement
-DB_CONFIG = {
- "host": os.getenv("MYSQL_HOST", "srv1653.hstgr.io"),
- "port": int(os.getenv("MYSQL_PORT", "3306")),
- "user": os.getenv("MYSQL_USER", "u122147766_Grenadine"),
- "password": os.getenv("MYSQL_PASSWORD"),
- "database": os.getenv("MYSQL_DATABASE", "u122147766_Grenadine"),
- "raise_on_warnings": True,
-}
+# URL de connexion Bright Data (à remplacer si elle change)
+BRIGHT_DATA_WSS_URL = "wss://brd-customer-hl_e179173a-zone-grenadine:gbwyvr478eg1@brd.superproxy.io:9222"
 
-# File d'attente pour traitement asynchrone
-message_queue = deque()
+# --- Variables Globales ---
+db_connection_pool = None
+seen_message_ids = set()
+seen_message_lock = asyncio.Lock()
 
-# Créer le dossier de backup
-Path(BACKUP_DIR).mkdir(exist_ok=True)
+# --- Fonctions de Base de Données (inchangées mais améliorées) ---
+
+def create_db_pool():
+    """Crée le pool de connexions à la base de données."""
+    global db_connection_pool
+    try:
+        db_connection_pool = pooling.MySQLConnectionPool(
+            pool_name="db_pool",
+            pool_size=5,
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            port=DB_PORT,
+            connect_timeout=10
+        )
+        logging.info("✅ Pool de connexions DB créé avec succès.")
+    except Error as e:
+        logging.critical(f"❌ Échec de la création du pool de connexions DB: {e}")
+        db_connection_pool = None
 
 def get_db_connection():
-    """Crée une connexion à la base de données MySQL"""
+    """Obtient une connexion depuis le pool."""
+    if db_connection_pool is None:
+        logging.error("Le pool de connexions n'est pas initialisé.")
+        return None
     try:
-        return mysql.connector.connect(**DB_CONFIG)
-    except mysql.connector.Error as err:
-        print(f"Erreur de connexion MySQL: {err}")
+        return db_connection_pool.get_connection()
+    except Error as e:
+        logging.error(f"Impossible d'obtenir une connexion DB: {e}")
         return None
 
-def init_db():
-    """Initialise la base de données MySQL"""
+# --- NOUVELLE FONCTION DE SCRAPING AVEC PLAYWRIGHT ---
+
+async def fetch_html_with_playwright():
+    """
+    Se connecte au navigateur distant de Bright Data via Playwright,
+    navigue vers tlk.io et retourne le HTML de la page.
+    """
+    async with async_playwright() as p:
+        logging.info("Connexion au navigateur distant de Bright Data...")
+        try:
+            browser = await p.chromium.connect_over_cdp(BRIGHT_DATA_WSS_URL)
+            page = await browser.new_page()
+            logging.info(f"Navigation vers https://tlk.io/grenadine..." )
+            await page.goto('https://tlk.io/grenadine', timeout=60000 ) # Timeout de 60s
+
+            # Attendre que les messages soient chargés. On cible un sélecteur CSS qui contient les messages.
+            await page.wait_for_selector('.message', timeout=30000)
+            logging.info("✅ Page et messages chargés.")
+
+            html_content = await page.content()
+            await browser.close()
+            return html_content
+        except Exception as e:
+            logging.error(f"❌ Erreur Playwright: {e}")
+            if 'browser' in locals() and browser.is_connected():
+                await browser.close()
+            return None
+
+# --- Fonctions de Traitement et Sauvegarde (adaptées) ---
+
+def parse_and_save_messages(html_content):
+    """Parse le HTML, extrait les messages et les sauvegarde en base de données."""
+    if not html_content:
+        return
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    messages_found = soup.select('.message') # Utilise le sélecteur CSS pour trouver les messages
+    logging.info(f"Trouvé {len(messages_found)} éléments de message dans le HTML.")
+
     conn = get_db_connection()
     if not conn:
         return
-    try:
-        c = conn.cursor()
-        c.execute(f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}")
-        conn.database = DB_CONFIG['database']
-        c.execute('''CREATE TABLE IF NOT EXISTS messages
-                     (id INT AUTO_INCREMENT PRIMARY KEY, 
-                      timestamp DATETIME, 
-                      author VARCHAR(255), 
-                      content TEXT,
-                      hash VARCHAR(32) UNIQUE)''')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_hash ON messages(hash)')
+    cursor = conn.cursor()
+
+    new_messages_count = 0
+    for msg_element in messages_found:
+        try:
+            # Extrait les données depuis les balises HTML
+            message_id = msg_element.get('data-id')
+            sender = msg_element.select_one('.user-name').get_text(strip=True)
+            content = msg_element.select_one('.body').get_text(strip=True)
+            # Le timestamp n'est pas facilement accessible, on utilise l'heure actuelle
+            # ou on pourrait essayer de le parser si disponible.
+            timestamp = msg_element.select_one('.timestamp a').get_text(strip=True)
+
+            if message_id and message_id not in seen_message_ids:
+                # Vérifier si le message existe déjà en DB
+                cursor.execute("SELECT id FROM messages WHERE message_id = %s", (message_id,))
+                if cursor.fetchone():
+                    seen_message_ids.add(message_id) # Marquer comme vu même s'il est déjà en DB
+                    continue
+
+                # Insérer le nouveau message
+                insert_query = "INSERT INTO messages (message_id, sender, content, timestamp) VALUES (%s, %s, %s, %s)"
+                cursor.execute(insert_query, (message_id, sender, content, timestamp))
+                seen_message_ids.add(message_id)
+                new_messages_count += 1
+
+        except Exception as e:
+            # logging.warning(f"Impossible de parser un élément de message: {e}")
+            continue
+
+    if new_messages_count > 0:
         conn.commit()
-    except mysql.connector.Error as err:
-        print(f"Erreur initialisation DB: {err}")
-    finally:
-        conn.close()
+        logging.info(f"✅ Sauvegardé {new_messages_count} nouveaux messages.")
 
-def message_hash(author: str, content: str) -> str:
-    """Génère un hash unique pour déduplication"""
-    return hashlib.md5(f"{author}:{content}".encode()).hexdigest()
+    cursor.close()
+    conn.close()
 
-async def save_message_external(msg_data: dict):
-    """Sauvegarde immédiate dans un fichier local JSONL"""
-    try:
-        async with aiofiles.open(EXTERNAL_LOG_FILE, mode='a', encoding='utf-8') as f:
-            await f.write(json.dumps(msg_data, ensure_ascii=False) + '\n')
-            await f.flush()
-    except Exception as e:
-        print(f"Erreur sauvegarde externe: {e}")
 
-async def process_message_queue():
-    """Traite la file d'attente des messages en arrière-plan"""
+async def scraper_loop():
+    """Boucle principale du scraper."""
+    logging.info("🚀 Démarrage de la boucle de scraping...")
     while True:
-        if message_queue:
-            msg_data = message_queue.popleft()
-            conn = get_db_connection()
-            if conn:
-                try:
-                    c = conn.cursor()
-                    msg_hash = message_hash(msg_data['author'], msg_data['content'])
-                    
-                    c.execute("SELECT id FROM messages WHERE hash=%s", (msg_hash,))
-                    if not c.fetchone():
-                        # Conversion du timestamp ISO en format MySQL DATETIME
-                        dt_obj = datetime.fromisoformat(msg_data['timestamp'].replace('Z', '+00:00'))
-                        mysql_ts = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
-                        
-                        c.execute("INSERT INTO messages (timestamp, author, content, hash) VALUES (%s, %s, %s, %s)",
-                                  (mysql_ts, msg_data['author'], msg_data['content'], msg_hash))
-                        conn.commit()
-                        
-                        await save_message_external(msg_data)
-                        print(f"✅ ARCHIVÉ: {msg_data['author']}: {msg_data['content'][:50]}")
-                except mysql.connector.Error as err:
-                    print(f"Erreur traitement message: {err}")
-                finally:
-                    conn.close()
-        await asyncio.sleep(0.1)
-
-def get_history(limit=500):
-    """Récupère l'historique des messages"""
-    conn = get_db_connection()
-    if not conn:
-        return "Erreur de connexion à la base de données."
-    try:
-        c = conn.cursor()
-        c.execute("SELECT timestamp, author, content FROM messages ORDER BY id DESC LIMIT %s", (limit,))
-        rows = c.fetchall()
-        if not rows:
-            return "Aucun message dans l'historique."
-        return "\n\n".join([f"[{r[0]}] **{r[1]}**: {r[2]}" for r in rows])
-    except mysql.connector.Error as err: 
-        return f"Erreur lors du chargement de l'historique: {err}"
-    finally:
-        conn.close()
-
-def export_to_file():
-    """Export complet de l'historique"""
-    conn = get_db_connection()
-    if not conn:
-        return None
-    try:
-        c = conn.cursor()
-        c.execute("SELECT timestamp, author, content FROM messages ORDER BY id ASC")
-        rows = c.fetchall()
+        html = await fetch_html_with_playwright()
+        if html:
+            parse_and_save_messages(html)
+        else:
+            logging.warning("Aucun contenu HTML reçu, nouvelle tentative dans 15s.")
         
-        file_path = f"{BACKUP_DIR}/full_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        with open(file_path, "w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(f"[{r[0]}] {r[1]}: {r[2]}\n")
-        return file_path
-    except Exception as e:
-        print(f"Erreur export: {e}")
-        return None
-    finally:
-        conn.close()
+        await asyncio.sleep(15) # Scrape toutes les 15 secondes pour ne pas abuser
 
-async def monitor():
-    """Surveillance ultra-rapide avec MutationObserver"""
-    init_db()
-    asyncio.create_task(process_message_queue())
+# --- Fonctions pour Gradio (inchangées) ---
+
+def get_message_history():
+    conn = get_db_connection()
+    if not conn:
+        return "<p>Erreur de connexion à la base de données.</p>"
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent="Mozilla/5.0")
-        page = await context.new_page()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT sender, content, timestamp FROM messages ORDER BY timestamp DESC LIMIT 100")
+        messages = cursor.fetchall()
         
-        print("🚀 Ouverture de tlk.io/grenadine...")
-        await page.goto("https://tlk.io/grenadine", wait_until="networkidle")
-        
-        await page.evaluate("""
-            () => {
-                window.newMessages = [];
-                const observer = new MutationObserver((mutations) => {
-                    mutations.forEach((mutation) => {
-                        mutation.addedNodes.forEach((node) => {
-                            if (node.nodeName === 'DL' && node.classList.contains('post')) {
-                                const author = node.querySelector('dt')?.innerText?.trim() || 'Unknown';
-                                const contentNodes = node.querySelectorAll('dd');
-                                const content = Array.from(contentNodes).map(dd => dd.innerText.trim()).join(' | ');
-                                if (author && content) {
-                                    window.newMessages.push({
-                                        author: author,
-                                        content: content,
-                                        timestamp: new Date().toISOString()
-                                    });
-                                }
-                            }
-                        });
-                    });
-                });
-                const liveSection = document.querySelector('#live');
-                if (liveSection) {
-                    observer.observe(liveSection, { childList: true, subtree: true });
-                }
-            }
-        """)
-        
-        while True:
-            try:
-                new_messages = await page.evaluate("window.newMessages.splice(0)")
-                if new_messages:
-                    for msg in new_messages:
-                        message_queue.append(msg)
-                
-                history = get_history()
-                yield f"🚀 **Surveillance Active (MySQL Hostinger)**\n\n{history}"
-            except Exception as e:
-                print(f"Erreur cycle: {e}")
-                await asyncio.sleep(5)
-            await asyncio.sleep(0.5)
+        history_html = ""
+        for sender, content, timestamp in reversed(messages):
+            history_html += f"<p><strong>{sender}</strong> ({timestamp}): {content}</p>"
+        return history_html if history_html else "<p>Aucun message trouvé.</p>"
+    except Error as err:
+        logging.error(f"Erreur DB dans get_message_history: {err}")
+        return "<p>Erreur lors de la récupération de l'historique.</p>"
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
 
-with gr.Blocks(title="Grenadine - MySQL") as demo:
-    gr.Markdown("# 🚀 Grenadine - Archivage MySQL")
-    with gr.Row():
-        with gr.Column(scale=4):
-            output = gr.Markdown(value="🔄 Initialisation...")
-        with gr.Column(scale=1):
-            btn_export = gr.Button("📥 Export .txt")
-            file_download = gr.File(label="Download")
-            btn_export.click(fn=export_to_file, outputs=file_download)
+# --- Démarrage de l'application ---
 
-    demo.load(monitor, outputs=output)
+def run_background_scraper():
+    """Fonction cible pour le thread qui exécute la boucle asyncio."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(scraper_loop())
+
+# Interface Gradio
+with gr.Blocks() as demo:
+    gr.Markdown("# Historique des messages tlk.io/grenadine")
+    history_display = gr.HTML()
+    demo.load(get_message_history, None, history_display)
+    timer = gr.Timer(5) # Rafraîchit l'affichage toutes les 5 secondes
+    timer.tick(get_message_history, None, history_display)
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860)
+    # Initialiser le pool de connexions DB
+    create_db_pool()
+
+    # Installer les navigateurs pour Playwright (nécessaire dans le Dockerfile)
+    # Note: cette commande doit être exécutée dans le shell du Dockerfile, pas ici.
+    # os.system("playwright install")
+
+    # Démarrer le scraper dans un thread séparé
+    scraper_thread = threading.Thread(target=run_background_scraper, daemon=True)
+    scraper_thread.start()
+    logging.info("✅ Scraper démarré en arrière-plan.")
+
+    # Lancer Gradio
+    demo.launch(server_name="0.0.0.0", server_port=7860)
