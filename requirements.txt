@@ -1,5 +1,4 @@
-playwright
-huggingface_hub
 gradio
-aiofiles
 mysql-connector-python
+beautifulsoup4
+playwright
